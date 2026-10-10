@@ -1,0 +1,388 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=0.65in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{caption}
+
+\graphicspath{{report_assets/25011138_ENG2440_A2_files/}}
+\newcommand{\placeholder}[1]{\textcolor{red}{[PLACEHOLDER: #1]}}
+\captionsetup[table]{skip=6pt}
+\captionsetup[figure]{skip=4pt}
+\setlength{\parindent}{0pt}
+\emergencystretch=2em
+\setlength{\parskip}{2pt}
+\setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
+\setlength{\floatsep}{5pt plus 2pt minus 2pt}
+\setlength{\intextsep}{5pt plus 2pt minus 2pt}
+\setlist{nosep,leftmargin=*}
+
+\title{ENG 2440 Assignment 2: Tumor Segmentation in MRI Volumes}
+\author{Md Aman Khan\\Student ID: 25011138\\\url{https://github.com/aman2712/Medical_Imaging_Assignment_2}}
+\date{Fall 2026}
+
+\begin{document}
+\maketitle
+\vspace*{-0.2in}
+
+\begin{abstract}
+This assignment built a PyTorch pipeline to segment the whole tumor from four-channel brain MRI volumes (MSD Task01 BrainTumour, 484 cases, supplied case-level split). Volumes were normalized using non-zero brain voxels and cropped to a fixed box, and a 1.4M-parameter 3D U-Net was trained on $64\times64\times64$ patches, comparing uniform and tumor-aware patch sampling under a controlled budget. Tumor-aware sampling gave a significantly higher validation sensitivity (0.847 vs 0.839) at similar Dice and was selected. With 50\% overlapping, Gaussian-blended sliding-window inference, the untouched test split gave a mean Dice of 0.851, IoU of 0.752, sensitivity of 0.849 and HD95 of 17.6\,mm with no empty predictions; a validation-selected 1\,mL component filter gave a Dice of 0.854 and an HD95 of 13.5\,mm. The target is a research reference segmentation, so the results do not establish clinical performance.
+\end{abstract}
+
+\section{Task and Target}
+\textbf{Input}: Multimodal 3D brain MRI of a patient, stored as NIfTI files. Each case has four co-registered channels (FLAIR, T1, T1ce and T2). Each of them being a $240\times240\times155$ volume at 1\,mm spacing. The model is trained on small 3D patches from these volumes and applied to the full volume at inference time.
+
+\textbf{Output}: A binary 3D mask with the same shape and geometry as the input. A voxel is 1 if it is predicted to be a whole tumor and 0 otherwise. The model first outputs a per-voxel tumor probability and then it is thresholded to get the mask.
+
+\textbf{Unit of analysis}: The patient case (one volume per patient). Splitting and evaluation are done per case. Voxels and patches are what the model learns from.
+
+\textbf{Intended technical use}: An exercise that outlines whole tumor so overlap and boundary quality can be measured against a reference segmentation. It is not an industry grade clinical tool and is not clinically validated.
+
+\begin{itemize}
+\item \textbf{Voxel}: a single $1\times1\times1$ mm point with four intensities and one label.
+\item \textbf{Slice}: a 2D cross-section of a volume used for viewing.
+\item \textbf{Volume}: the full 3D scan with an affine that maps it to physical coordinates.
+\item \textbf{Patient case}: one patient with all four modalities and the label.
+\end{itemize}
+
+\section{Data Inspection}
+Channel order from \texttt{dataset.json}: FLAIR, T1w, t1gd (T1ce), T2w. Three training cases were loaded; all share the same geometry.
+
+\begin{table}[H]
+\centering
+\caption{Geometry of the three inspected training cases (image and label share the same affine).}
+\small
+\begin{tabular}{lllllll}
+\toprule
+Case & Image shape & Label shape & Spacing (mm) & Orientation & Affine & Label values\\
+\midrule
+BRATS\_001 & (240, 240, 155, 4) & (240, 240, 155) & (1, 1, 1) & RAS & identity & 0, 1, 2, 3\\
+BRATS\_003 & (240, 240, 155, 4) & (240, 240, 155) & (1, 1, 1) & RAS & identity & 0, 1, 2, 3\\
+BRATS\_004 & (240, 240, 155, 4) & (240, 240, 155) & (1, 1, 1) & RAS & identity & 0, 1, 2, 3\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.72\linewidth]{25011138_ENG2440_A2_16_0.png}
+\caption{FLAIR, T1, T1ce and T2 of BRATS\_001 at axial slice 63 (physical $z=63$\,mm), with the reference mask.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.5\linewidth]{25011138_ENG2440_A2_20_0.png}
+\caption{Reference mask over FLAIR in the axial, coronal and sagittal planes through the tumor centre (voxel $(157,116,67)$).}
+\end{figure}
+
+File-index order alone is not enough because the array axes [i, j, k] can only describe how the data is stored. They do not say which anatomical direction each axis points to. The affine matrix and orientation codes are needed to map voxel indices to physical positions in mm and to know which axis is left-right, front-back or up-down. Another file could have a different orientation or voxel spacing. So, the same index would then refer to a different location or give a stretched image. A slice index is also not a physical distance until it is multiplied by the voxel spacing.
+
+\section{Case-Level Split}
+The supplied \texttt{assignment2\_split.csv} was used exactly (484 cases). All listed images and labels exist (0 missing), and the train, validation and test case identifiers are pairwise disjoint. The test labels were used only to report the volume distribution here and for final evaluation.
+
+\begin{table}[H]
+\centering
+\caption{Case counts and whole-tumor reference volume (mL) per split.}
+\small
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Split & Cases & Mean & Std & Min & 25\% & Med. & 75\% & Max\\
+\midrule
+Train & 338 & 103.0 & 57.0 & 8.5 & 60.0 & 95.5 & 143.9 & 265.3\\
+Validation & 73 & 100.8 & 63.0 & 7.3 & 51.9 & 91.6 & 148.1 & 266.9\\
+Test & 73 & 107.4 & 66.3 & 10.1 & 54.4 & 89.1 & 157.7 & 318.3\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.3\linewidth]{25011138_ENG2440_A2_30_0.png}
+\caption{Whole-tumor volume per split.}
+\end{figure}
+
+\section{Preprocessing and Augmentation}
+All 484 cases have the same geometry. Each image has 4 channels with shape $240\times240\times155$ and $1\times1\times1$ mm spacing, all in RAS orientation with an identity affine, and the label matches the image in shape, spacing, orientation and affine in all cases. because the four channels are stored in one file, they share a single grid with the label. Resampling is not needed, so the native grid ($240\times240\times155$, 1\,mm isotropic) is kept as the common target grid for all cases.
+
+Interpolation was demonstrated by resampling BRATS\_001 from 1\,mm to 2\,mm (shape $(240,240,155)\to(120,120,78)$): linear interpolation was used for the MRI and nearest-neighbour for the label. The nearest-neighbour label contains only the values $\{0,1,2,3\}$, whereas linear interpolation of the label produced 4039 non-integer voxels, so labels must not be linearly interpolated.
+
+Each MRI channel was normalized with statistics from non-zero brain voxels only (brain fraction 0.167 of the volume). For BRATS\_001 the normalized mean and standard deviation of every channel are 0.0 and 1.0 over brain voxels (raw brain means 472--781).
+
+All the volumes were cropped to a fixed box of $168\times192\times152$ voxels. Starting at voxel (36, 19, 0). The box was chosen from the bounding box of the non-zero brain voxels across all cases (x 38--200, y 19--211, z 0--149), so no brain or tumor voxels are removed. It removes a huge part of the empty background which reduces memory and compute. Every dimension is a multiple of 8 so that the 3D U-Net can down sample and up sample without any size mismatches. The same box is applied to the image and the label so they stay aligned. Anywhere the box would leave the volume it is zero-padded.
+
+Augmentation is applied to the training split only. A left-right flip is implemented with probability 0.5 to the image and label together, as the brain is approximately symmetric and the tumor can appear on either side. Each channel also receives a small random intensity scale (0.9 to 1.1), shift ($-0.1$ to 0.1) and gaussian noise (std deviation 0.05), applied to brain voxels only so the background stays 0. This simulates any scanner and acquisition differences. These intensity changes are applied only to the image and never to the label. Rotations, scaling and elastic deformation are not used because they require interpolating the label and could introduce invalid label values or distort tumor boundaries. Flips along any other axes are not used because they are not anatomically possible (for example upside-down brains).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.31\linewidth]{25011138_ENG2440_A2_43_0.png}
+\caption{Paired before/after training-only augmentation (cropped, normalized FLAIR with the reference contour).}
+\end{figure}
+
+\section{Patch-Based Volumetric Training}
+\begin{table}[H]
+\centering
+\caption{Dataset batch and model.}
+\small
+\begin{tabular}{ll}
+\toprule
+Item & Value\\
+\midrule
+Image batch $[B,C,D,H,W]$ & $(4,4,64,64,64)$, float32\\
+Mask batch $[B,1,D,H,W]$ & $(4,1,64,64,64)$, float32, values $\{0,1\}$\\
+Model & 3D U-Net, base filters 16, 4 input channels, 1 output channel\\
+Trainable parameters & 1,402,561\\
+Patch size $(D,H,W)$ & $(64,64,64)$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The model was first trained using uniform random patches of size $64\times64\times64$. The loss used was binary cross-entropy (BCE) with logits combined with a soft Dice loss, optimized using Adam with a learning rate of $10^{-3}$. The training budget was 20 epochs of 50 iterations each (1000 iterations in total) with a batch size of 4. The random seed was 42, which also fixes the model initialization and the patches that are sampled. After each epoch the model was evaluated on 100 fixed validation patches and the weights with the highest validation Dice were kept.
+
+The tumor-aware run used the same initialization (verified identical weights), seed, loss, optimizer and budget; only the sampler differed (tumor\_prob $=0.5$). Over the full budget (4000 patches), the fraction of sampled patches containing tumor was 0.679 for the uniform sampler and 0.843 for the tumor-aware sampler. Best patch-level validation Dice was 0.8182 (uniform, epoch 15) and 0.8496 (tumor-aware, epoch 17).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.66\linewidth]{25011138_ENG2440_A2_64_0.png}
+\caption{Training and validation loss for both samplers, and validation Dice.}
+\end{figure}
+
+The training and validation losses for the uniform sampler decreased together from about 1.4 to about 0.4 and stayed close to each other, so no clear sign of overfitting. The validation dice increased to 0.818 at epoch 15 but then dropped to 0.726 by epoch 20. The validation loss also went up slightly in the last two epochs. The training loss did not continue to decrease in this period so this looks like instability from a small batch size of 4, a constant learning rate and a validation set of only 100 patches. The losses were also still decreasing at the end of training, which suggests that the model is slightly undertrained because of the small training budget.
+
+The tumor aware sampler showed a similar trend. The validation dice reached 0.850 at epoch 17 and had some fluctuations (for e.g. at epochs 4, 14, 16). Its training loss was lower than its validation loss by about 0.1 to 0.15. This is not necessarily overfitting because the training patches were chosen to contain more tumor than the uniformly sampled validation patches, so the two losses are measured on different patch distributions. Model selection uses the validation dice only and the test split was not used at any point.
+
+\section{Controlled Sampling Comparison}
+\begin{table}[H]
+\centering
+\caption{Uniform versus tumor-aware sampling on the 73 validation cases (full-volume sliding-window inference, threshold 0.5). Same architecture, split, loss and budget. $p$: paired Wilcoxon test.}
+\small
+\begin{tabular}{lrrr}
+\toprule
+Metric & Uniform & Tumor-aware & $p$\\
+\midrule
+Dice, mean $\pm$ std & $0.807\pm0.119$ & $0.810\pm0.141$ & 0.2449\\
+Sensitivity, mean $\pm$ std & $0.839\pm0.125$ & $0.847\pm0.155$ & 0.0035\\
+False-positive volume, mean (mL) & 16.7 & 18.2 & 0.2275\\
+False-positive volume, median (mL) & 12.5 & 12.8 & --\\
+False-negative volume, mean (mL) & 16.1 & 12.7 & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both samplers gave very similar validation Dice (0.810 for tumor-aware and 0.807 for uniform, $p=0.24$), so the main difference is in the balance between missed tumor and false alarms. Tumor-aware sampling gave a slightly higher sensitivity (0.847 vs 0.839) which was statistically significant in a paired Wilcoxon test ($p=0.0035$), and the mean volume of missed tumor (false negatives) dropped from 16.1\,mL to 12.7\,mL. The mean false-positive volume was slightly higher (18.2\,mL vs 16.7\,mL), but this difference was not significant ($p=0.23$).
+
+This is consistent with the sampling mechanism. With tumor-aware sampling 84.3\% of the training patches contained tumor compared to 67.9\% for uniform sampling, so the model sees more tumor voxels, including boundaries and small tumor regions, and the loss penalizes missed tumor more often. This pushes the model towards predicting tumor, which raises sensitivity. However, it sees fewer tumor-free patches of normal brain, which gives less practice at rejecting tumor-like normal regions, so false positives do not decrease and are slightly higher. As this is a single training run per sampler with a small budget, the differences are small and should not be over-interpreted.
+
+The tumor-aware configuration was selected as the final configuration using validation evidence only. The selection rule was to choose the sampler with the higher validation Dice and, if the Dice difference was not significant, to break the tie using sensitivity. The validation Dice was practically the same for the two samplers (0.810 for tumor-aware and 0.807 for uniform, $p=0.24$), but tumor-aware sampling achieved a significantly higher sensitivity (0.847 vs 0.839, $p=0.0035$) and a lower missed tumor volume (12.7\,mL vs 16.1\,mL). It also had a higher validation Dice on the fixed validation patches (0.850 vs 0.818). The cost was a slightly higher false-positive volume (18.2\,mL vs 16.7\,mL) and a larger spread of Dice across cases, so the choice favors detecting more of the tumor at the expense of some extra false alarms.
+
+One disadvantage of excessive tumor oversampling is that the model would see tumor in almost every training patch and would therefore overestimate how likely tumor is. At inference time most of a sliding-window volume is normal brain, so this mismatch between the training and test distributions would produce more false-positive predictions in normal tissue and poorly calibrated probabilities. If patches are always centered on tumor voxels the model can also learn a position bias, as it rarely sees tumor at the patch border.
+
+\section{Full-Volume Reconstruction and Evaluation}
+Full-volume predictions were made with overlapping sliding-window inference over the cropped volume. The patch size was $64\times64\times64$ voxels and the stride was 32 voxels in every direction, which gives a 50\% overlap between neighboring patches and 100 windows per volume ($5\times5\times4$). The last window along each axis is shifted back so that the whole volume is covered. The patch probabilities were combined using a Gaussian-weighted average, voxels near the center of a patch count more than voxels near its border (sigma $=0.25\times$ patch size). The summed probabilities were divided by the summed weights at every voxel, and only then thresholded at 0.5 to obtain the binary mask. Combining probabilities before thresholding avoids the hard seams that appear when each patch is thresholded separately, and it reduces the unreliable predictions at patch borders where the context is incomplete.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}[t]{0.47\linewidth}
+\centering
+\captionof{table}{Whole-tumor test results over 73 cases (final tumor-aware model, threshold 0.5, no postprocessing).}
+\scriptsize
+\begin{tabular}{lrrr}
+\toprule
+Metric & Mean & Std & Median\\
+\midrule
+Dice & 0.851 & 0.103 & 0.872\\
+IoU & 0.752 & 0.135 & 0.774\\
+Sensitivity & 0.849 & 0.123 & 0.888\\
+HD95 (mm) & 17.555 & 20.272 & 9.274\\
+\bottomrule
+\end{tabular}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.50\linewidth}
+\centering
+\captionof{table}{Test-set tumor volume and volume error (73 cases, before postprocessing).}
+\scriptsize
+\begin{tabular}{lrrr}
+\toprule
+ & Mean & Median & Max\\
+\midrule
+Reference volume (mL) & 107.39 & 89.11 & 318.35\\
+Predicted volume (mL) & 104.63 & 92.92 & 299.69\\
+Signed error (mL) & $-2.75$ & $-2.46$ & 90.47\\
+Absolute error (mL) & 16.99 & 10.98 & 90.47\\
+Absolute error (\%) & 22.05 & 15.72 & 274.14\\
+\bottomrule
+\end{tabular}
+\end{minipage}
+\end{figure}
+
+Empty predictions: 0 of 73. Overlap was good for most cases: 59 of 73 cases had Dice $\ge0.8$ and only 4 were below 0.7 (lowest BRATS\_376, 0.339, then BRATS\_078, 0.532). The mean Dice (0.851) is below the median (0.872), so a few poor cases pull the mean down. Boundary error is more skewed: HD95 has a mean of 17.6\,mm but a median of 9.3\,mm and a standard deviation of 20.3\,mm, because 14 cases exceed 30\,mm (maximum 122.5\,mm in BRATS\_466, whose Dice was 0.742). A high Dice can therefore coexist with a large HD95, which is consistent with the lower mean HD95 after small components were removed (below).
+
+Per-case reference and predicted volumes were converted to millilitres using the voxel spacing (1\,mm isotropic, 0.001\,mL per voxel); the full per-case table of volumes and absolute and percentage errors is given in Appendix Table~\ref{tab:percase}.
+
+The prediction was larger than the reference in 34 of 73 cases. Volume was not systematically biased on average (mean signed error $-2.75$\,mL; 39 cases under-segmented and 34 over-segmented), but individual errors were sizeable: the mean absolute error was 17.0\,mL (median 11.0\,mL) and 52 of 73 cases were within 25\%. Percentage errors are largest for small tumors: the median was 25.5\% for the 17 cases with a reference volume below 50\,mL against 9.6\% for the rest, and the three cases above 50\% error were BRATS\_376 (274\%, 10\,mL reference), BRATS\_078 (106\%) and BRATS\_192 (52\%, under-segmented).
+
+One connected-component rule was applied after the thresholding: connected components (26-connectivity) smaller than 1mL or a 1000 voxels were removed. The rule was chosen using the validation split, before looking at the test results. It was compared with ``keeping only the largest component'' and with minimum sizes of 1, 5 and 10mL.
+Keeping only the largest component gave the best HD95 value but reduced the validation sensitivity from 0.847 to 0.816, because the reference masks often times have several components (58 of 73 validation cases) and this rule deletes real tumor parts. Larger size thresholds also reduced sensitivity. The 1mL rule was the only one that left the validation sensitivity unchanged (0.847) while still slightly improving the Dice (0.810 to 0.815) and the HD95 (31.4 to 26.3mm). A component smaller than 1mL is less than about 12 mm across, so it is more likely to be a stray false positive than a real part of the tumor.
+
+\begin{table}[H]
+\centering
+\caption{Candidate postprocessing rules on the validation split (mean over 73 cases).}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Rule & Dice & Sens. & HD95 mean & HD95 median & FP vol. (mL) & Empty\\
+\midrule
+None & 0.810 & 0.847 & 31.375 & 18.221 & 18.150 & 0\\
+Keep largest component & 0.821 & 0.816 & 14.304 & 7.810 & 12.477 & 0\\
+Remove $<1$\,mL & 0.815 & 0.847 & 26.297 & 10.724 & 17.362 & 0\\
+Remove $<5$\,mL & 0.815 & 0.836 & 19.707 & 8.062 & 16.222 & 0\\
+Remove $<10$\,mL & 0.809 & 0.828 & 17.980 & 7.810 & 15.453 & 2\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Test results before and after the chosen rule (remove components $<1$\,mL); 70 of 73 cases changed, 0 empty predictions after.}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+ & \multicolumn{3}{c}{Before} & \multicolumn{3}{c}{After}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Metric & Mean & Std & Median & Mean & Std & Median\\
+\midrule
+Dice & 0.851 & 0.103 & 0.872 & 0.854 & 0.103 & 0.875\\
+IoU & 0.752 & 0.135 & 0.774 & 0.757 & 0.134 & 0.778\\
+Sensitivity & 0.849 & 0.123 & 0.888 & 0.848 & 0.124 & 0.888\\
+HD95 (mm) & 17.555 & 20.272 & 9.274 & 13.484 & 12.914 & 9.055\\
+FP volume (mL) & 12.006 & 16.301 & 8.228 & 11.459 & 16.139 & 7.747\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On the test split the rule changed the results slightly: the mean dice went from 0.851 to 0.854, the mean sensitivity persisted at about 0.85 and the mean HD95 decreased from 17.6 to 13.5mm, while the median HD95 barely changed (9.3 to 9.1mm). The rule was selected because of the validation evidence and the reasoning given above, and not because of the test improvement.
+
+\section{Three-Plane Error Analysis and Limitations}
+Best, median and worst test cases by Dice (after postprocessing) are shown in three planes through the reference centroid (reference in blue, prediction in orange) and through the largest error component (true positive green, false positive orange, false negative pink).
+
+\begin{table}[H]
+\centering
+\caption{Best, median and worst test cases by Dice (after postprocessing).}
+\scriptsize
+\begin{tabular}{llrrrrrrrr}
+\toprule
+Case & ID & Dice & HD95 (mm) & Sens. & FP (mL) & FN (mL) & Ref. (mL) & Pred. (mL) & Vol. err. (\%)\\
+\midrule
+Best & BRATS\_451 & 0.963 & 1.41 & 0.964 & 7.343 & 6.643 & 186.26 & 186.96 & 0.38\\
+Median & BRATS\_293 & 0.875 & 4.69 & 0.983 & 16.634 & 1.064 & 63.06 & 78.63 & 24.69\\
+Worst & BRATS\_376 & 0.330 & 40.76 & 0.753 & 28.369 & 2.499 & 10.10 & 35.97 & 256.11\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In the best case (BRATS\_451, Dice 0.963) the errors are thin bands along the tumor boundary, with similar amounts of false-positive (7.3\,mL) and false-negative (6.6\,mL) volume. In the median case (BRATS\_293, Dice 0.875) almost all of the tumor was found (sensitivity 0.983), but a band of false positives surrounds the tumor (16.6\,mL), so the tumor is over-segmented. These are boundary errors: the edge between the edema and the normal brain is gradual in the FLAIR image and the reference boundary itself is partly subjective, so the model's boundary is often a voxel or two away from the reference.
+
+The worst case (BRATS\_376, Dice 0.330) is a small structure error. The reference tumor is small (about 10\,mL) and lies near the midline, and the model also marked larger bright FLAIR regions at the skull base as tumor, giving 28.4\,mL of false positives, nearly three times the size of the true tumor. As the reference tumor is small, a few false-positive regions are enough to reduce Dice a lot. The false positives are far from the tumor, which suggests the $64\times64\times64$ patches provide too little context to tell these bright regions apart from real tumor, though this was not tested directly.
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.37\linewidth}
+\centering
+\includegraphics[width=\linewidth]{25011138_ENG2440_A2_106_0.png}
+\captionof{figure}{Reference (blue) and prediction (orange) contours.}
+\end{minipage}\hfill
+\begin{minipage}{0.37\linewidth}
+\centering
+\includegraphics[width=\linewidth]{25011138_ENG2440_A2_108_0.png}
+\captionof{figure}{True-positive, false-positive and false-negative voxels.}
+\end{minipage}
+\end{figure}
+
+The three metrics describe the three cases differently. In the best case (BRATS\_451) the Dice is 0.96 and the HD95 is 1.4\,mm, but the volume error is only 0.38\% even though about 14\,mL of voxels are misplaced (7.3\,mL false positive and 6.6\,mL false negative), because the extra and missing voxels cancel out. In the median case (BRATS\_293) the Dice (0.88) and HD95 (4.7\,mm) look acceptable, but the predicted volume is 25\% too large, which shows over-segmentation. In the worst case (BRATS\_376) the HD95 of 40.8\,mm comes from false-positive regions far from the tumor, and the Dice of 0.33 is low because the reference tumor is small (10\,mL) compared to the 28\,mL of false positives. Its volume error of 256\% is also inflated by the small reference volume.
+
+One metric cannot summarize every failure because Dice measures overlap and is dominated by large structures, HD95 reacts to small distant errors, and volume error ignores where the voxels are. Across the whole test set, Dice is strongly related to volume error (Spearman $\rho=-0.89$) but only moderately related to HD95 ($\rho=-0.51$), so they capture different information.
+
+\textbf{Limitations.}
+\begin{enumerate}
+\item Small training budget. Each model was trained for only 1000 iterations (batch size 4, $64\times64\times64$ patches) with a small 3D U-Net (1.4M parameters) and a constant learning rate. The losses were still decreasing at the end and the validation Dice was unstable (it fell from 0.82 to 0.73 over the last epochs of the uniform run), so the models are probably undertrained and the results are not the best that this architecture can reach.
+\item No external-site validation. The training, validation and test cases all come from the same dataset (Medical Segmentation Decathlon Task01, derived from BraTS). The test set is therefore drawn from the same distribution as the training set, and the results say nothing about how the model would work on other scanners, hospitals or acquisition protocols.
+\item Duplicate scans in the supplied split. Six pairs of cases have identical reference masks and the same images up to an intensity scaling (BRATS\_015/280, 013/288, 007/290, 002/293, 010/278, 001/275). One pair is split between training and validation (BRATS\_013 and BRATS\_288), which makes the validation scores very slightly optimistic, and the two test cases BRATS\_002 and BRATS\_293 are the same scan, so the test set has 72 independent patients instead of 73.
+\end{enumerate}
+
+\section{Conclusion}
+Tumor-aware patch sampling gave a significantly higher validation sensitivity than uniform sampling (0.847 vs 0.839, $p=0.0035$) at statistically similar Dice and was selected using validation evidence only. On the untouched test split the final model reached a mean Dice of 0.851 (median 0.872) and a mean HD95 of 17.6\,mm with no empty predictions; removing components smaller than 1\,mL, chosen on validation, gave 0.854 and 13.5\,mm. Given the small training budget, single-dataset evaluation and duplicate scans in the split, these results are a research benchmark and not evidence of clinical performance.
+
+\clearpage
+\appendix
+\section*{Appendix}
+\section*{Bonus A: Missing-Modality Stress Test}
+\begin{table}[H]
+\centering
+\caption{Test results with one channel zeroed at test time, without retraining (after postprocessing, 73 cases).}
+\small
+\resizebox{\linewidth}{!}{\begin{tabular}{lrrrrrrrr}
+\toprule
+Condition & Dice mean & Dice median & Sens. & HD95 mean & HD95 median & Vol. err. (mL) & Vol. err. (\%) & Empty\\
+\midrule
+All four channels & 0.854 & 0.875 & 0.848 & 13.484 & 9.055 & 16.870 & 21.510 & 0\\
+FLAIR zeroed & 0.067 & 0.000 & 0.039 & 31.546 & 26.926 & 99.057 & 94.277 & 44\\
+T1w zeroed & 0.828 & 0.857 & 0.898 & 28.711 & 21.095 & 19.338 & 33.032 & 0\\
+t1gd zeroed & 0.819 & 0.866 & 0.792 & 13.456 & 7.842 & 21.163 & 25.387 & 1\\
+T2w zeroed & 0.787 & 0.843 & 0.811 & 27.236 & 15.108 & 23.838 & 33.402 & 0\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Zeroing one channel at test time, without retraining, shows that the model relies very unequally on its four inputs. FLAIR was by far the most influential channel. With FLAIR zeroed the mean Dice fell from 0.854 to 0.067, sensitivity fell to 0.039 and 44 of 73 cases had an empty prediction. This is expected because the whole-tumor reference is dominated by edema, which is bright on FLAIR. Zeroing T2w, T1ce or T1w reduced the Dice to 0.787, 0.819 and 0.828, so these channels carry smaller, complementary information. Zeroing T1w or T2w also roughly doubled the mean HD95 (13.5 to 28.7 and 27.2\,mm). The FLAIR HD95 (31.5\,mm) is computed only on the 29 non-empty cases, so it is not directly comparable.
+
+Zeroing is an imperfect simulation of a missing acquisition. After normalization, zero is the average brain intensity and not the absence of signal, so the network receives a plausible but wrong value in every brain voxel, a pattern that it never saw in training. A real missing sequence would also lack the contrast it provides, while the other channels would still have their own noise and scanner differences. Training could be redesigned for missing modalities with modality dropout, where channels are randomly removed during training so that the model learns to work with whatever is available. Alternatively, separate encoders per modality with feature fusion could be used.
+
+\section*{Bonus B: Sliding-Window Seam Test}
+\begin{table}[H]
+\centering
+\caption{Test results for the same model at three overlaps (after postprocessing, mean over 73 cases).}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Overlap & Windows & Runtime (s) & Dice & HD95 (mm) & Sens. & Vol. err. (mL)\\
+\midrule
+0\% (stride 64) & 27 & 0.313 & 0.809 & 19.863 & 0.787 & 21.643\\
+25\% (stride 48) & 48 & 0.540 & 0.839 & 16.358 & 0.826 & 17.258\\
+50\% (stride 32) & 100 & 1.198 & 0.854 & 13.484 & 0.848 & 16.870\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.68\linewidth]{25011138_ENG2440_A2_132_0.png}
+\caption{Probability difference $|p(0\%)-p(50\%)|$ near patch borders: example axial slice (left) and mean difference versus distance to the nearest 0\%-overlap patch border (right).}
+\end{figure}
+
+Increasing the overlap from 0\% to 50\% raised the mean test Dice from 0.809 to 0.854 and lowered the mean HD95 from 19.9 to 13.5\,mm, but the runtime per volume rose from 0.31\,s to 1.20\,s (27 versus 100 windows). The 25\% overlap was in between (Dice 0.839, 0.54\,s). The probability difference between 0\% and 50\% overlap was largest at the patch borders of the 0\% grid (mean 0.024) and fell to 0.0004 at the patch center, so the differences are concentrated along the seams. Voxels near a patch border have less context and see the zero padding of the convolutions, so their predictions are less reliable. Overlap helps most when structures cross patch borders, as large tumors do, because the Gaussian blending predicts each voxel mainly from the patches where it is near the center. It helps less for small structures that lie inside one patch, and it costs more runtime.
+
+The 50\% overlap was fixed in advance and used for all main results, so this comparison is only a sensitivity analysis. If the overlap were chosen after repeatedly inspecting the test labels, the choice would be tuned to this specific test set, so the test scores would be optimistically biased and no longer an honest estimate for unseen data. The overlap should be selected on the validation split.
+
+\section*{Per-Case Test Results}
+\input{per_case_table.tex}
+
+\section*{References}
+\scriptsize
+\sloppy
+All figures in this report were generated from the executed assignment notebook; no external figure was reproduced.
+\begin{enumerate}[nosep]
+\item Antonelli, M., Reinke, A., Bakas, S., et al. The Medical Segmentation Decathlon. \emph{Nature Communications}, 13:4128, 2022. doi:10.1038/s41467-022-30695-9.
+\item Medical Segmentation Decathlon Organizers. \emph{Medical Segmentation Decathlon: Task01 BrainTumour}. 2018.\\
+\url{https://medicaldecathlon.com/dataaws/}. Accessed September 2026.
+\item Menze, B. H., Jakab, A., Bauer, S., et al. The Multimodal Brain Tumor Image Segmentation Benchmark (BRATS). \emph{IEEE Transactions on Medical Imaging}, 34(10):1993--2024, 2015. doi:10.1109/TMI.2014.2377694.
+\item Paszke, A., Gross, S., Massa, F., et al. PyTorch: An imperative style, high-performance deep learning library. In \emph{Advances in Neural Information Processing Systems}, 32, 2019.\\
+\url{https://pytorch.org/}
+\item The implementation also used nibabel, NumPy, SciPy, pandas and Matplotlib for NIfTI handling, numerical processing, connected components and Wilcoxon tests, tabular processing and plotting.\\
+\url{https://nipy.org/nibabel/}\quad\url{https://numpy.org/}\quad\url{https://scipy.org/}\quad\url{https://pandas.pydata.org/}\quad\url{https://matplotlib.org/}
+\end{enumerate}
+
+\end{document}

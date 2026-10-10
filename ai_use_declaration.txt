@@ -6,5 +6,45 @@ Student ID: 25011138
 Module: ENG 2440 Medical Imaging & AI in Healthcare
 Assignment: Assignment 2 - Tumor Segmentation in MRI Volumes
 
-(TODO: name each tool, purpose, prompts or interaction link, and affected sections.
-If none was used, state: "I did not use a generative-AI or large-language-model tool for this assignment.")
+I used generative-AI tools during the preparation of this assignment. I remained
+responsible for the submitted code, results, interpretations, references and
+written claims. I tested the code and checked the outputs myself, and I can
+explain and reproduce the submitted work.
+
+1. Claude Code
+--------------
+
+Tool: Claude Code in Visual Studio Code.
+
+Purpose of use:
+
+- Python/PyTorch concepts, error messages and implementation problems.
+- To suggest code for notebook cells and for the supporting modules in scripts/, which I ran, tested and adapted.
+- To review the notebook, scripts and report against the assignment brief and flag errors or inconsistencies.
+- To set up the LaTeX report structure, copy text from my notebook into report.tex.
+
+Representative prompt types:
+
+- "Check the notebook end to end against the assignment brief and flag anything wrong."
+- "Create the report in the structure of the first assignment, copying text from the notebook and adding placeholders where none exists."
+- "Fix the alignment of this table and figure and keep the report within the page limit."
+
+Affected submission parts:
+
+- Notebook cells and the supporting modules in the scripts/ directory.
+- report.tex and report.pdf, including figure placement, layout and page count.
+- README.md, requirements.txt.
+
+Claude Code did not determine the assignment's data split, which was supplied.
+I ran all experiments myself, and the numerical results come from my own
+executed notebook. I reviewed and tested any suggestions before using them.
+
+2. Independent work, verification and limits
+--------------------------------------------
+
+I executed the notebook, ran the experiments, and checked the reported metrics
+and figures against the notebook outputs.
+
+I did not use an AI tool to fabricate experiments, outputs, references or
+interpretations. The raw MRI volumes and masks were not uploaded to an external
+AI service.
