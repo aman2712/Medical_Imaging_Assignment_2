@@ -1,0 +1,10 @@
+AI Use Declaration
+==================
+
+Student: Md Aman Khan
+Student ID: 25011138
+Module: ENG 2440 Medical Imaging & AI in Healthcare
+Assignment: Assignment 2 - Tumor Segmentation in MRI Volumes
+
+(TODO: name each tool, purpose, prompts or interaction link, and affected sections.
+If none was used, state: "I did not use a generative-AI or large-language-model tool for this assignment.")
